@@ -2,8 +2,8 @@
 
 > 一个本地运行的 CS2 小工具集合。左侧导航切换功能，右侧显示内容。
 
-目前有两块：**Demo 统计**（导入 `.dem` 录像做逐玩家战绩）和 **Major Pick'em**
-（HLTV Major 模拟器的完整对阵与种子）。
+两块功能：**Demo 统计**（导入 `.dem` 录像做逐玩家战绩）和 **Major Pick'em**
+（HLTV Major 实时数据 + Valve Swiss 规则推演）。
 
 ![Demo 统计](screenshots/01-overview.png)
 
@@ -15,36 +15,41 @@
 
 - **按半场切分**：上半场 / 下半场 / 加时三段，可以**多选叠加**看合并数据。
 - **按队伍分栏**：上下两队固定成「队伍 1 / 队伍 2」名册，中途换边也不会串。
-  中间的**分隔线可以拖**。
-- **回合时间轴**：一条轴线画完所有回合，悬停出悬浮窗，**单击**出右侧完整事件时间轴。
+- **回合时间轴**：悬停出悬浮窗，**单击**出右侧完整事件时间轴。
 - **三个页签**：主要数据 / 道具伤害 / 娱乐数据。
-- **导出 CSV**：当前视图一键导出。
+- **导出 CSV**。
 
 ![回合详情](screenshots/02-round-detail.png)
 
-| 页签 | 看什么 |
-|---|---|
-| **主要数据** | Rating、击杀 / 死亡 / 助攻、K/D、爆头率、ADR、总伤害、首杀 / 首死、2K~5K |
-| **道具伤害** | 手雷 / 燃烧 / 诱饵伤害、道具总伤、**道具占比**、每回合道具伤害、闪光助攻 |
-| **娱乐数据** | 杀鸡、刀杀、电击枪杀、下包 / 拆包、Teamkill、自杀、**团队伤害（友军火力）** |
-
 ### Major Pick'em
 
-把 HLTV Major 模拟器（Swiss 轮）的完整对阵与种子抄进本地，分四个页签展示：
-**Stage 1 / Stage 2 / Stage 3 / Playoffs**。
+![Major Pick'em](screenshots/08-pickem-live.png)
 
-![Major Pick'em](screenshots/05-pickem-stage1.png)
+按 **Valve Swiss 规则**画对阵图，**点某一队就是判它赢**，对阵自动推进到下一轮。
 
-- 每个 Swiss 阶段左侧是**对阵表**（组别、双方队伍、种子、时间），右侧是**参赛队伍与种子**。
-- 淘汰赛页列出 Quarter-finals / Semi-finals / Grand final 的槽位。
-- 数据来自本地快照 `data/hltv-major.json`，只读展示，不联网。
+- 每一列是一轮，列内按战绩分组（`0-0` / `1-0` / `0-1` …）
+- 队伍带**真实 Logo**，赢的行高亮，输的行变暗
+- 整张图**按住鼠标可拖动**，滚轮上下滚
+- 已结束的比赛会自动套用真实赛果
+- 底部实时显示「晋级 / 淘汰」名单
+
+#### 晋级规则
+
+| 阶段 | 规则 |
+|---|---|
+| **首轮配对** | 按种子对折：1 号打 9 号、2 号打 10 号 … 8 号打 16 号（种子差恒为 8） |
+| **之后每轮** | 按当前战绩分组，赢一场进「胜场+1」的组，输一场进「负场+1」的组 |
+| **组内排序** | Buchholz 规则（对手胜场和），并避开已经交手过的队伍 |
+| **BO 格式** | 2 胜或 2 负的组打 BO3，其余 BO1 |
+| **晋级** | 先到 **3 胜**直接晋级（3-0 / 3-1 / 3-2） |
+| **淘汰** | 先到 **3 负**直接淘汰（0-3 / 1-3 / 2-3） |
 
 ## 快速开始
 
 ### 1. 环境要求
 
 - Windows + PowerShell 5.1（系统自带）
-- Python 3.10+，Demo 统计需要：
+- Python 3.10+，Demo 统计需要 `demoparser2` 与 `pandas`
 
 ```
 python -m pip install demoparser2 pandas
@@ -54,95 +59,92 @@ python -m pip install demoparser2 pandas
 
 双击 `CS2Demo分析器.exe`，不会弹终端。
 
-（等价入口：`启动.vbs`，或命令行
-`powershell -STA -NoProfile -ExecutionPolicy Bypass -File DemoAnalyzer.ps1`。）
+### 3. 更新 Pick'em 数据
 
-### 3. 使用
+```bash
+python tools/hltv_mobile.py --event 9303
+```
 
-- **Demo 统计**：点「选择 demo 文件...」→ 选 `.dem` → 「开始分析」。
-  CS2 默认 demo 目录在
-  `...\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\game\csgo\`。
-- **Major Pick'em**：直接看，数据来自下面的快照。
+`--event` 是 HLTV 的事件 ID（9303 = PGL Major Singapore 2026 Stage 1）。
+用 `--majors` 可以列出当前所有 Major 事件。
 
-## 更新 Pick'em 数据
+## 数据从哪来
 
-HLTV 前面挂着 Cloudflare 人机验证，实测这些通道全部被拦：
+**HLTV 移动端 API**：`https://www.hltv.org/mobile/`
+
+网页版挂了 Cloudflare，实测这些通道全部被拦：
 
 | 通道 | 结果 |
 |---|---|
 | Python urllib / requests | 403 `Just a moment...` |
-| curl（带全套浏览器头） | 403 |
+| curl（全套浏览器头） | 403 |
 | Node fetch | 403 |
 | Edge `--headless=new --dump-dom` | 返回「请稍候…」挑战页 |
 
-能过验证的只有真实浏览器会话，所以流程是**两步**：
+但**官方 Android 客户端**用的是另一套接口，只认移动端 UA：
 
-1. 在浏览器里打开 <https://www.hltv.org/major/simulator>，确认能看到对阵表，
-   按 Ctrl+S 存成 `.html`；
-2. 转成快照：
-
-```bash
-python tools/fetch-hltv-sim.py --html "C:\path\to\simulator.html"
+```
+User-Agent: org.hltv.android/3.0.34;release(Android; SM-S918B; Android 14)
 ```
 
-它会写出 `data/hltv-major.json`，重开软件即可看到新数据。
+这套接口**不需要 cookie、不需要代理、不需要人机验证**，直接 GET 就返回 JSON：
+
+| 端点 | 返回 |
+|---|---|
+| `/mobile/startupCheck` | 200 |
+| `/mobile/MatchesV4` | 200（~1.5MB，全部比赛 + 队伍 + Logo） |
+| `/mobile/MatchScreen?matchId=…` | 200（单场详情） |
+
+少数端点要求完整性签名（如 `/FrontpageV2` 返回 `integrity_required`），
+但比赛相关接口都能用，足够本项目使用。
+
+> 这个思路来自 GitHub 上的 [pickem-prediction-model](https://github.com/Leclowndu93150/pickem-prediction-model)
+> 项目——它用 `hltv_api` 包装了同一套移动端接口。
 
 ## 项目结构
 
 ```
-DemoAnalyzer.ps1       主程序（导航壳 + WinForms 界面 + 全部绘制）
-CS2Demo分析器.exe       无控制台启动器（src/Launcher.cs 编译产物）
-src/Launcher.cs        启动器源码
-src/analyzer.py        分析核心：解析 demo，输出 out/report.json
-tools/fetch-hltv-sim.py  把 HLTV 模拟器页面转成 data/hltv-major.json
-data/hltv-major.json   Pick'em 数据快照
-docs/技术说明.md        完整技术文档（口径、公式、踩坑记录）
-screenshots/           界面截图
-out/                   运行产物（report.json / progress.json / 截图）
-*.ps1                  各个回归测试与出图脚本
+DemoAnalyzer.ps1         主程序（导航壳 + WinForms + 自绘对阵图）
+CS2Demo分析器.exe         无控制台启动器
+src/Launcher.cs          启动器源码
+src/analyzer.py          demo 分析核心
+tools/hltv_mobile.py     HLTV 移动端 API 抓取
+data/major-live.json     Major 实时数据
+data/hltv-major.json     旧的整页快照（兜底）
+assets/logos/            队伍 Logo（PNG）
+docs/技术说明.md          完整技术文档
+screenshots/             界面截图
 ```
 
 ## 数据口径（挑几条容易踩的）
 
-- **总伤害只算敌人的实际掉血**。`player_hurt` 里的 `dmg_health` 是**没截断**的原始伤害，
-  AWP 爆头一枪就是 438，但满血只有 100，直接累加会把溢出伤害也算进去（实测虚高 26%）。
-  现在按「打之前的血量」做上限。
+- **总伤害只算敌人的实际掉血**。`dmg_health` 是**没截断**的原始伤害，
+  AWP 爆头一枪 438 但满血只有 100，直接累加会虚高 26%。
 - **Rating 是近似 HLTV Rating 2.0**，不是官方数字。
-  本局标定平均 1.13（理想 1.00）。
-- **玩家以名字归并**，SteamID64 超过 float64 精度（>2^53），经 pandas 读取末位会漂移，
-  所以只用来展示，不做关联键。
-- **半场分界写死 MR12**。非标准模式需要改 `HALF_ROUNDS`。
+- **玩家以名字归并**，SteamID64 超过 float64 精度（>2^53），末位会漂移。
+- **半场分界写死 MR12**。
 
-完整的公式推导、权重标定过程、以及一堆 WinForms / PowerShell 的坑，
-都写在 **[docs/技术说明.md](docs/技术说明.md)** 里。
+详见 **[docs/技术说明.md](docs/技术说明.md)**。
 
 ## 回归测试
 
-这些脚本都不需要人手点，跑完打印 OK / FAIL：
-
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File DemoAnalyzer.ps1 -SelfTest   # 含导航与 Pick'em 页断言
-powershell -NoProfile -ExecutionPolicy Bypass -File uicheck.ps1     # 界面结构与配色
-powershell -NoProfile -ExecutionPolicy Bypass -File clicktest.ps1   # 真实按钮回调 + 进度条采样
-powershell -STA -NoProfile -ExecutionPolicy Bypass -File dragtest.ps1     # 分隔条 / 表格平移 / 边界钳制
-powershell -STA -NoProfile -ExecutionPolicy Bypass -File tltest.ps1       # 时间轴布局与拖动
-powershell -STA -NoProfile -ExecutionPolicy Bypass -File ratingtest.ps1   # 两份 Rating 实现逐条对账
-powershell -STA -NoProfile -ExecutionPolicy Bypass -File detailtest.ps1   # 详情栏单击 / 拖动不误触发
-powershell -STA -NoProfile -ExecutionPolicy Bypass -File bartest.ps1      # 自绘进度条像素级对账
+powershell -NoProfile -ExecutionPolicy Bypass -File DemoAnalyzer.ps1 -SelfTest
+powershell -NoProfile -ExecutionPolicy Bypass -File uicheck.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File clicktest.ps1
+powershell -STA -NoProfile -ExecutionPolicy Bypass -File dragtest.ps1
+powershell -STA -NoProfile -ExecutionPolicy Bypass -File tltest.ps1
+powershell -STA -NoProfile -ExecutionPolicy Bypass -File ratingtest.ps1
 ```
-
-> Demo 相关测试读的是 `out/report.json`，也就是**最近一次分析的结果**。
-> 分析任何 demo 都会覆盖它，所以换过 demo 之后测试照样跑得过
-> （断言都是「按叠加重算 == 叠加」这类自洽关系）。
 
 ## 已知限制
 
-- 只支持 MR12；加时面板在没加时的对局里是空的。
-- 队伍名只能叫「队伍 1 / 队伍 2」：demo 里 `team_clan_name` 实测是空串。
-- 分析期间不能取消（没有取消按钮）。
-- 时间轴只列事件，不能播放回放，也没有热力图。
-- 详情里的武器是文字（`[awp]`），没有图标。
-- Pick'em 数据是**快照**，不会自动刷新；要更新得按上面的两步重新生成。
+- 只支持 MR12。
+- 队伍名只能叫「队伍 1 / 队伍 2」：demo 里 `team_clan_name` 是空串。
+- 分析期间不能取消。
+- Pick'em 的 Stage 2 / Stage 3 数据要换 `--event` 重新抓；
+  部分队伍（如 Astralis、MOUZ）HLTV 只给 SVG，PNG 转换会被签名拦住。
+- Tab 顺序按事件分组，跨阶段不会自动衔接。
 
 ## License
 

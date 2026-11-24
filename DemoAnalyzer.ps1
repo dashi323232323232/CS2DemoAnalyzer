@@ -545,280 +545,714 @@ function New-NavButton {
     return $b
 }
 
-# ---------------- Major Pick'em 页 ----------------
-# 页面结构：顶部赛事信息 + 四个阶段页签（Stage 1 / 2 / 3 / Playoffs），
-# 下面是该阶段的 Swiss 轮对阵表。
-# 数据来自 data\hltv-major.json 快照，只读展示，不做预测计算。
-function New-HltvPickemPage {
+# ---------------- Major Pick'em：Live 数据 + 交互式 Swiss ----------------
+# 数据来源：HLTV 移动端 API（见 tools/hltv_mobile.py）。
+# 网页版有 Cloudflare，普通 HTTP 客户端一律 403；但官方 Android 客户端的
+# /mobile/ 接口只认移动端 UA，直接 GET 就返回 JSON，不需要 cookie 或代理。
+$HltvLiveJson = Join-Path $Root 'data\major-live.json'
+
+function Load-HltvLive {
+    if (-not (Test-Path $HltvLiveJson)) { return $null }
+    try { return (Get-Content $HltvLiveJson -Raw -Encoding UTF8 | ConvertFrom-Json) }
+    catch { return $null }
+}
+
+# 旧快照（模拟器整页抓下来的）当兜底：Live 数据没有的时候还能显示赛程
+$HltvJson = Join-Path $Root 'data\hltv-major.json'
+function Load-Hltv {
+    if (-not (Test-Path $HltvJson)) { return $null }
+    try { return (Get-Content $HltvJson -Raw -Encoding UTF8 | ConvertFrom-Json) }
+    catch { return $null }
+}
+
+# logo 缓存：Image.FromFile 只加载一次。别在 Paint 里反复 New，
+# 那会持续泄漏 GDI 句柄，拖几十秒界面就卡死。
+$script:LogoCache = @{}
+
+function Clear-LogoCache {
+    foreach ($k in @($script:LogoCache.Keys)) {
+        try { if ($script:LogoCache[$k]) { $script:LogoCache[$k].Dispose() } } catch { }
+    }
+    $script:LogoCache = @{}
+}
+
+function Get-TeamLogo {
+    param([string]$Name)
+    if (-not $Name) { return $null }
+    if ($script:LogoCache.ContainsKey($Name)) { return $script:LogoCache[$Name] }
+    $img = $null
+    try {
+        $safe = ($Name -replace '[^\w\-]', '_')
+        $p = Join-Path $Root ("assets\logos\$safe.png")
+        if (Test-Path $p) {
+            # 从字节流加载，避免锁住文件（Image.FromFile 会一直占着句柄）
+            $bytes = [System.IO.File]::ReadAllBytes($p)
+            $ms = New-Object System.IO.MemoryStream(,$bytes)
+            $img = [System.Drawing.Image]::FromStream($ms)
+        }
+    } catch { $img = $null }
+    $script:LogoCache[$Name] = $img
+    return $img
+}
+
+# ---- Swiss 引擎 ----
+# 完整的 Swiss 配对/推进逻辑放在 src/pickem.ps1，那里有对着 HLTV 真实赛果的回归测试
+# （test-pickem.ps1，首轮与第二轮对阵 8/8 命中）。这里只负责 dot-source 进来。
+. (Join-Path $Root "src\pickem.ps1")
+
+# ---- 画布：HLTV 版式（深色底、Logo、点谁谁赢） ----
+function New-PickemCanvas {
+    param($St)
+
+    $cv = New-Object System.Windows.Forms.Panel
+    $cv.Dock = 'Fill'
+    $cv.BackColor = [System.Drawing.Color]::FromArgb(18, 20, 26)
+    $cv.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $cv.Margin = New-Object System.Windows.Forms.Padding(0)
+    Enable-DoubleBuffer $cv
+
+    $th = @{
+        Bg      = [System.Drawing.Color]::FromArgb(18, 20, 26)
+        Card    = [System.Drawing.Color]::FromArgb(28, 31, 38)
+        CardWin = [System.Drawing.Color]::FromArgb(30, 58, 44)
+        CardHov = [System.Drawing.Color]::FromArgb(38, 43, 54)
+        Edge    = [System.Drawing.Color]::FromArgb(48, 53, 62)
+        EdgeWin = [System.Drawing.Color]::FromArgb(72, 187, 120)
+        Txt     = [System.Drawing.Color]::FromArgb(235, 238, 243)
+        Dim     = [System.Drawing.Color]::FromArgb(118, 126, 138)
+        Accent  = [System.Drawing.Color]::FromArgb(96, 165, 250)
+        Win     = [System.Drawing.Color]::FromArgb(72, 187, 120)
+        Lose    = [System.Drawing.Color]::FromArgb(220, 100, 100)
+        GroupBg = [System.Drawing.Color]::FromArgb(24, 26, 33)
+        FontNm  = (New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5))
+        FontNmB = (New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5, [System.Drawing.FontStyle]::Bold))
+        FontHd  = (New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5, [System.Drawing.FontStyle]::Bold))
+        FontSm  = (New-Object System.Drawing.Font('Microsoft YaHei UI', 8))
+        FontVs  = (New-Object System.Drawing.Font('Segoe UI', 7.5, [System.Drawing.FontStyle]::Bold))
+    }
+
+    $CW = 218; $ROW = 37; $CH = 97; $GAP = 7
+    $HEAD = 20; $GGAP = 14; $COLW = 250; $PADX = 22; $PADY = 34
+
+    $cv.Tag = @{
+        St = $St; Th = $th
+        Pan = @{ X = 0; Y = 0 }
+        Drag = @{ On = $false; X = 0; Y = 0; Moved = $false }
+        Hover = $null
+        Cards = (New-Object System.Collections.ArrayList)
+        Groups = $null
+        ByCol = $null
+        CW = $CW; ROW = $ROW; CH = $CH; GAP = $GAP
+        HEAD = $HEAD; GGAP = $GGAP; COLW = $COLW; PADX = $PADX; PADY = $PADY
+    }
+
+    # 布局计算
+    $cv.Tag.ReLayout = {
+        param($self)
+        $t = $self.Tag
+        $groups = Get-SwissGroups -Stage $t.St
+        $byCol = @{}
+        foreach ($k in @($groups.Keys)) {
+            $g = $groups[$k]
+            $col = [int]$g.W + [int]$g.L
+            if (-not $byCol.ContainsKey($col)) { $byCol[$col] = (New-Object System.Collections.ArrayList) }
+            [void]$byCol[$col].Add($g)
+        }
+        $maxY = 0
+        foreach ($col in @($byCol.Keys)) {
+            $y = $t.PADY
+            $list = @($byCol[$col]) | Sort-Object @{ Expression = { - [int]$_.W } }
+            foreach ($g in $list) {
+                $g.Y = $y
+                $n = @($g.Items).Count
+                $g.BoxH = [Math]::Max(1, $n) * ($t.CH + $t.GAP) - $t.GAP
+                $y = $y + $t.HEAD + $g.BoxH + $t.GGAP
+            }
+            if ($y -gt $maxY) { $maxY = $y }
+        }
+        $cards = (New-Object System.Collections.ArrayList)
+        foreach ($col in @($byCol.Keys)) {
+            foreach ($g in @($byCol[$col])) {
+                $x = $t.PADX + ([int]$col) * $t.COLW
+                $yy = $g.Y + $t.HEAD
+                $i = 0
+                foreach ($mt in @($g.Items)) {
+                    [void]$cards.Add(@{ Match = $mt; X = $x; Y = $yy + $i * ($t.CH + $t.GAP)
+                            W = [int]$t.CW; H = [int]$t.CH; Wa = [int]$g.W; La = [int]$g.L })
+                    $i++
+                }
+            }
+        }
+        $t.Cards = $cards
+        $t.Groups = $groups
+        $t.ByCol = $byCol
+        $t.TotalH = $maxY + $t.PADY
+    }
+    & $cv.Tag.ReLayout $cv
+
+    $cv.Add_Paint({
+            param($s, $e)
+            $t = $s.Tag
+            $th = $t.Th
+            $g = $e.Graphics
+            $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
+            $g.Clear($th.Bg)
+            $px = $t.Pan.X; $py = $t.Pan.Y
+
+            # 列标题
+            $hb = New-Object System.Drawing.SolidBrush($th.Dim)
+            try {
+                foreach ($ci in (@($t.ByCol.Keys) | Sort-Object)) {
+                    $x = $t.PADX + ([int]$ci) * $t.COLW + $px
+                    $cap = if ([int]$ci -eq 0) { '第一轮' } elseif ([int]$ci -ge 4) { '出线 / 淘汰' } else { '第{0}轮' -f ([int]$ci + 1) }
+                    $g.DrawString($cap, $th.FontHd, $hb, [single]$x, [single]([int]$py + 8))
+                }
+            } finally { $hb.Dispose() }
+
+            # 组底板
+            foreach ($k in @($t.Groups.Keys)) {
+                $grp = $t.Groups[$k]
+                $col = [int]$grp.W + [int]$grp.L
+                $x = $t.PADX + $col * $t.COLW + $px
+                $y = $grp.Y + $py
+                $bg = New-Object System.Drawing.SolidBrush($th.GroupBg)
+                try {
+                    $rr = New-Object System.Drawing.Rectangle([int]$x, [int]($y - 4), [int]$t.CW, [int]($grp.BoxH + 8))
+                    $g.FillRectangle($bg, $rr)
+                } finally { $bg.Dispose() }
+                $ab = New-Object System.Drawing.SolidBrush($th.Accent)
+                try { $g.DrawString(('{0}-{1}' -f $grp.W, $grp.L), $th.FontSm, $ab, [single]($x + 7), [single]($y + 4)) } finally { $ab.Dispose() }
+            }
+
+            # 卡片
+            $idx = 0
+            foreach ($cd in $t.Cards) {
+                $x = $cd.X + $px
+                $y = $cd.Y + $py
+                $cw = [int]$cd.W; $chh = [int]$cd.H; $rowH = [int]$t.ROW
+                if ($x -gt ($s.Width + 300) -or ($x + $cw) -lt -300) { $idx++; continue }
+
+                $mt = $cd.Match
+                $hovA = ($t.Hover -and $t.Hover.Card -eq $idx -and $t.Hover.Side -eq 'A')
+                $hovB = ($t.Hover -and $t.Hover.Card -eq $idx -and $t.Hover.Side -eq 'B')
+                $wonA = ($mt.Winner -eq 'A'); $wonB = ($mt.Winner -eq 'B')
+                $isDone = [bool]$mt.Winner
+
+                $gs = $g.Save()
+                $g.TranslateTransform([single]$x, [single]$y)
+                try {
+                    $path = Get-RoundPath -W $cw -H $chh -R 9
+                    $fill = New-Object System.Drawing.SolidBrush($th.Card)
+                    $pen = New-Object System.Drawing.Pen($(if ($isDone) { $th.EdgeWin } else { $th.Edge }), 1)
+                    try { $g.FillPath($fill, $path); $g.DrawPath($pen, $path) }
+                    finally { $fill.Dispose(); $pen.Dispose(); $path.Dispose() }
+
+                    $si = 0
+                    foreach ($side in @('A', 'B')) {
+                        $nm = if ($side -eq 'A') { [string]$mt.A } else { [string]$mt.B }
+                        $ry = 6 + $si * $rowH
+                        $isHov = if ($side -eq 'A') { $hovA } else { $hovB }
+                        $isWin = if ($side -eq 'A') { $wonA } else { $wonB }
+                        $isLos = ($isDone -and -not $isWin)
+
+                        if ($isWin -or $isHov) {
+                            $hb2 = New-Object System.Drawing.SolidBrush($(if ($isWin) { $th.CardWin } else { $th.CardHov }))
+                            $hp = Get-RoundPath -W ($cw - 8) -H ($rowH - 2) -R 6
+                            $g2 = $g.Save()
+                            $g.TranslateTransform(4, [single]($ry - 1))
+                            try { $g.FillPath($hb2, $hp) } finally { $g.Restore($g2); $hb2.Dispose(); $hp.Dispose() }
+                        }
+
+                        $logo = Get-TeamLogo -Name $nm
+                        $lx = 9; $ly = $ry + 4; $ls = 26
+                        if ($logo) { $g.DrawImage($logo, (New-Object System.Drawing.Rectangle($lx, $ly, $ls, $ls))) }
+                        else {
+                            $ph = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(42, 47, 58))
+                            try { $g.FillEllipse($ph, $lx, $ly, $ls, $ls) } finally { $ph.Dispose() }
+                        }
+
+                        $fc = if ($isLos) { $th.Dim } else { $th.Txt }
+                        $fb = New-Object System.Drawing.SolidBrush($fc)
+                        $fnt = if ($isWin) { $th.FontNmB } else { $th.FontNm }
+                        try {
+                            $short = $nm
+                            if ($short.Length -gt 15) { $short = $short.Substring(0, 14) + '..' }
+                            $g.DrawString($short, $fnt, $fb, [single]($lx + $ls + 7), [single]($ly + 5))
+                        } finally { $fb.Dispose() }
+
+                        if ($isWin) {
+                            $wb = New-Object System.Drawing.SolidBrush($th.Win)
+                            try { $g.DrawString('W', $th.FontVs, $wb, [single]($cw - 19), [single]($ry + 12)) } finally { $wb.Dispose() }
+                        } elseif ($isLos) {
+                            $lb = New-Object System.Drawing.SolidBrush($th.Lose)
+                            try { $g.DrawString('L', $th.FontVs, $lb, [single]($cw - 19), [single]($ry + 12)) } finally { $lb.Dispose() }
+                        }
+
+                        if ($side -eq 'A') {
+                            $sep = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(58, 64, 76), 1)
+                            try { $g.DrawLine($sep, 9, ($rowH + 4), ($cw - 9), ($rowH + 4)) } finally { $sep.Dispose() }
+                        }
+                        $si++
+                    }
+
+                    # 底部：BO 标记 / 比分
+                    $ft = New-Object System.Drawing.SolidBrush($th.Dim)
+                    try {
+                        $boTxt = if ([int]$mt.Bo -ge 3) { 'BO3' } else { 'BO1' }
+                        $boCol = if ([int]$mt.Bo -ge 3) { [System.Drawing.Color]::FromArgb(214, 160, 74) } else { $th.Dim }
+                        $ft2 = New-Object System.Drawing.SolidBrush($boCol)
+                        try { $g.DrawString($boTxt, $th.FontSm, $ft2, [single]($cw - 34), [single]($chh - 14)) } finally { $ft2.Dispose() }
+                    } finally { $ft.Dispose() }
+                } finally { $g.Restore($gs) }
+                $idx++
+            }
+        })
+
+    $cv.Tag.HitTest = {
+        param($self, $mx, $my)
+        $t = $self.Tag
+        $i = 0
+        foreach ($cd in $t.Cards) {
+            $x = $cd.X + $t.Pan.X; $y = $cd.Y + $t.Pan.Y
+            if ($mx -ge $x -and $mx -le ($x + [int]$cd.W) -and $my -ge $y -and $my -le ($y + [int]$cd.H)) {
+                $rel = $my - $y
+                $side = if ($rel -lt (6 + [int]$t.ROW)) { 'A' } else { 'B' }
+                return @{ Card = $i; Side = $side }
+            }
+            $i++
+        }
+        return $null
+    }
+
+    $cv.Add_MouseDown({ param($s, $e) $s.Tag.Drag.On = $true; $s.Tag.Drag.X = $e.X; $s.Tag.Drag.Y = $e.Y; $s.Tag.Drag.Moved = $false })
+    $cv.Add_MouseUp({
+            param($s, $e)
+            $t = $s.Tag
+            $was = $t.Drag.Moved
+            $t.Drag.On = $false
+            if ($was) { return }
+            $hit = & $t.HitTest $s $e.X $e.Y
+            if (-not $hit) { return }
+            $cd = $t.Cards[$hit.Card]
+            if ($cd.Match.Winner) { return }
+            if (Set-SwissWinner -Stage $t.St -Match $cd.Match -Side $hit.Side) {
+                Update-SwissStage -Stage $t.St | Out-Null
+                & $t.ReLayout $s
+                $s.Invalidate()
+                if ($t.OnChanged) { & $t.OnChanged }
+            }
+        })
+    $cv.Add_MouseMove({
+            param($s, $e)
+            $t = $s.Tag
+            if ($t.Drag.On) {
+                $dx = $e.X - $t.Drag.X; $dy = $e.Y - $t.Drag.Y
+                if ([Math]::Abs($dx) -gt 2 -or [Math]::Abs($dy) -gt 2) { $t.Drag.Moved = $true }
+                $t.Pan.X += $dx; $t.Pan.Y += $dy
+                $t.Drag.X = $e.X; $t.Drag.Y = $e.Y
+                $s.Invalidate()
+            } else {
+                $hit = & $t.HitTest $s $e.X $e.Y
+                $old = $t.Hover
+                $chg = $false
+                if (-not $hit -and $old) { $chg = $true }
+                elseif ($hit -and (-not $old -or $old.Card -ne $hit.Card -or $old.Side -ne $hit.Side)) { $chg = $true }
+                $t.Hover = $hit
+                if ($chg) { $s.Invalidate() }
+                $s.Cursor = if ($hit) { [System.Windows.Forms.Cursors]::Hand } else { [System.Windows.Forms.Cursors]::SizeAll }
+            }
+        })
+    $cv.Add_MouseWheel({ param($s, $e) $s.Tag.Pan.Y += [int]($e.Delta / 3); $s.Invalidate() })
+    $cv.Add_Resize({ param($s, $e) $s.Invalidate() })
+
+    return $cv
+}
+
+
+# ---- 页面 ----
+# ---- Pick'em 页面：四个阶段页签（Stage 1/2/3 + Playoffs）----
+function New-PickemPage {
     $page = New-Object System.Windows.Forms.Panel
     $page.Dock = 'Fill'
-    $page.BackColor = (Get-UiBg)
+    $page.BackColor = [System.Drawing.Color]::FromArgb(18, 20, 26)
     $page.Visible = $false
+    $page.Margin = New-Object System.Windows.Forms.Padding(0)
 
     $lay = New-Object System.Windows.Forms.TableLayoutPanel
     $lay.Dock = 'Fill'
     $lay.ColumnCount = 1
     $lay.RowCount = 3
-    $lay.BackColor = (Get-UiBg)
+    $lay.BackColor = [System.Drawing.Color]::FromArgb(18, 20, 26)
     $lay.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 100))) | Out-Null
-    $lay.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 78))) | Out-Null
+    $lay.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 58))) | Out-Null
     $lay.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 100))) | Out-Null
-    $lay.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 26))) | Out-Null
+    $lay.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 32))) | Out-Null
     $page.Controls.Add($lay)
 
-    # ---- 顶部：赛事名 + 抓取时间 ----
     $head = New-Object System.Windows.Forms.Panel
     $head.Dock = 'Fill'
-    $head.BackColor = [System.Drawing.Color]::White
-    $head.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 6)
-    Enable-RoundCard -Control $head -Radius 12
+    $head.BackColor = [System.Drawing.Color]::FromArgb(24, 26, 33)
+    $head.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 4)
     $lay.Controls.Add($head, 0, 0)
 
     $lblTitle = New-Object System.Windows.Forms.Label
-    $lblTitle.Location = New-Object System.Drawing.Point(16, 12)
-    $lblTitle.Size = New-Object System.Drawing.Size(900, 26)
+    $lblTitle.Location = New-Object System.Drawing.Point(16, 6)
+    $lblTitle.Size = New-Object System.Drawing.Size(700, 24)
     $lblTitle.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 12, [System.Drawing.FontStyle]::Bold)
-    $lblTitle.ForeColor = [System.Drawing.Color]::FromArgb(17, 24, 39)
+    $lblTitle.ForeColor = [System.Drawing.Color]::FromArgb(240, 243, 248)
     $lblTitle.Text = 'Major Pick''em'
     $head.Controls.Add($lblTitle)
 
     $lblSub = New-Object System.Windows.Forms.Label
-    $lblSub.Location = New-Object System.Drawing.Point(18, 42)
-    $lblSub.Size = New-Object System.Drawing.Size(1100, 20)
-    $lblSub.ForeColor = [System.Drawing.Color]::FromArgb(107, 114, 128)
-    $lblSub.Text = '正在读取本地快照…'
+    $lblSub.Location = New-Object System.Drawing.Point(18, 31)
+    $lblSub.Size = New-Object System.Drawing.Size(1000, 18)
+    $lblSub.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8.5)
+    $lblSub.ForeColor = [System.Drawing.Color]::FromArgb(130, 138, 150)
+    $lblSub.Text = '正在读取…'
     $head.Controls.Add($lblSub)
 
-    # ---- 中部：阶段页签 + 内容 ----
-    $body = New-Object System.Windows.Forms.Panel
-    $body.Dock = 'Fill'
-    $body.BackColor = [System.Drawing.Color]::White
-    $body.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 6)
-    Enable-RoundCard -Control $body -Radius 12
-    $lay.Controls.Add($body, 0, 1)
+    $btnReset = New-Object System.Windows.Forms.Button
+    $btnReset.Text = '重置'
+    $btnReset.Size = New-Object System.Drawing.Size(70, 26)
+    $btnReset.Location = New-Object System.Drawing.Point(1120, 14)
+    $btnReset.FlatStyle = 'Flat'
+    $btnReset.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(62, 68, 80)
+    $btnReset.BackColor = [System.Drawing.Color]::FromArgb(32, 36, 44)
+    $btnReset.ForeColor = [System.Drawing.Color]::FromArgb(212, 218, 228)
+    $btnReset.Anchor = 'Top,Right'
+    $btnReset.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+    $head.Controls.Add($btnReset)
 
     $tabs = New-Object System.Windows.Forms.TabControl
     $tabs.Dock = 'Fill'
-    $tabs.ItemSize = New-Object System.Drawing.Size(150, 32)
+    $tabs.ItemSize = New-Object System.Drawing.Size(126, 30)
     $tabs.SizeMode = 'Fixed'
-    $tabs.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
-    # Margin 会让 Dock=Fill 的控件超出父容器，右边和下边被裁掉 —— 设成 0。
     $tabs.Margin = New-Object System.Windows.Forms.Padding(0)
-    $tabs.Padding = New-Object System.Drawing.Point(14, 6)
-    $body.Controls.Add($tabs)
+    $tabs.Padding = New-Object System.Drawing.Point(14, 5)
+    $tabs.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
+    $lay.Controls.Add($tabs, 0, 1)
 
-    # ---- 底部：数据来源 ----
+    $foot = New-Object System.Windows.Forms.Panel
+    $foot.Dock = 'Fill'
+    $foot.BackColor = [System.Drawing.Color]::FromArgb(24, 26, 33)
+    $lay.Controls.Add($foot, 0, 2)
+
     $lblFoot = New-Object System.Windows.Forms.Label
     $lblFoot.Dock = 'Fill'
-    $lblFoot.ForeColor = [System.Drawing.Color]::FromArgb(156, 163, 175)
+    $lblFoot.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8.5)
+    $lblFoot.ForeColor = [System.Drawing.Color]::FromArgb(150, 158, 170)
     $lblFoot.TextAlign = 'MiddleLeft'
+    $lblFoot.Padding = New-Object System.Windows.Forms.Padding(14, 0, 0, 0)
     $lblFoot.Text = ''
-    $lay.Controls.Add($lblFoot, 0, 2)
+    $foot.Controls.Add($lblFoot)
 
-    $page.Tag = @{ Data = $null; Tabs = $tabs; Sub = $lblSub; Foot = $lblFoot; Title = $lblTitle }
+    $page.Tag = @{
+        Stages   = (New-Object System.Collections.ArrayList)
+        Tabs     = $tabs
+        Sub      = $lblSub
+        Foot     = $lblFoot
+        Title    = $lblTitle
+        ResetBtn = $btnReset
+        Data     = $null
+    }
+
+    $btnReset.Add_Click({
+            $p = $script:App.Nav.Pages['hltv']
+            if ($p) { Render-PickemPage -Page $p }
+        })
+
     return $page
 }
 
-# 把快照渲染进页面。页面建好后调用一次；重新抓取数据后再调一次即可刷新。
-function Render-HltvPickem {
+
+# 渲染整个 Pick'em 页：建 Stage 1/2/3 + Playoffs 四个页签
+function Render-PickemPage {
     param($Page)
     if (-not $Page) { return }
     $t = $Page.Tag
-    $data = Load-Hltv
-    $t.Data = $data
 
+    $data = $null
+    $allPath = Join-Path $Root 'data\all-stages.json'
+    if (Test-Path $allPath) {
+        try { $data = Get-Content $allPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+    }
     if (-not $data) {
-        $t.Sub.Text = '没有找到本地快照 data\hltv-major.json。运行 tools\fetch-hltv-sim.py 生成。'
-        $t.Foot.Text = ''
+        $t.Sub.Text = '没有 data\all-stages.json'
         return
     }
 
+    $t.Data = $data
     $t.Title.Text = ('Major Pick''em — ' + $data.event)
-    $t.Sub.Text = ('数据抓取于 {0}｜来源 {1}' -f $data.fetchedAt, $data.source)
-    $t.Foot.Text = ('共 {0} 个 Swiss 阶段 + 淘汰赛' -f @($data.stages).Count)
-
     $t.Tabs.TabPages.Clear()
+    [void]$t.Stages.Clear()
 
-    # Swiss 阶段
-    foreach ($st in @($data.stages)) {
+    for ($i = 0; $i -lt 3; $i++) {
+        $sd = $data.stages[$i]
+        $teams = @()
+        foreach ($tm in @($sd.teams)) {
+            $teams += @{ name = $tm.name; teamId = $tm.teamId; logo = $tm.logo; seed = $tm.seed }
+        }
+        $st = New-SwissStage -Name $sd.name -Teams $teams
+        Add-SwissRound -Stage $st
+        [void]$t.Stages.Add($st)
+
         $tp = New-Object System.Windows.Forms.TabPage
-        $tp.Text = $st.name
-        $tp.BackColor = [System.Drawing.Color]::White
-        $tp.Padding = New-Object System.Windows.Forms.Padding(10)
-        $tp.Controls.Add((New-SwissStageView -Stage $st))
+        $tp.Text = $sd.name
+        $tp.BackColor = [System.Drawing.Color]::FromArgb(18, 20, 26)
+        $tp.Padding = New-Object System.Windows.Forms.Padding(0)
         $t.Tabs.TabPages.Add($tp)
     }
 
-    # 淘汰赛
-    $po = New-Object System.Windows.Forms.TabPage
-    $po.Text = 'Playoffs'
-    $po.BackColor = [System.Drawing.Color]::White
-    $po.Padding = New-Object System.Windows.Forms.Padding(10)
-    $po.Controls.Add((New-PlayoffView -Playoffs $data.playoffs))
-    $t.Tabs.TabPages.Add($po)
+    $poTp = New-Object System.Windows.Forms.TabPage
+    $poTp.Text = 'Playoffs'
+    $poTp.BackColor = [System.Drawing.Color]::FromArgb(18, 20, 26)
+    $poTp.Padding = New-Object System.Windows.Forms.Padding(0)
+    $t.Tabs.TabPages.Add($poTp)
+
+    $live = $null
+    $livePath = Join-Path $Root 'data\major-live.json'
+    if (Test-Path $livePath) {
+        try { $live = Get-Content $livePath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+    }
+    if ($live) { Apply-RealResults -Stage $t.Stages[0] -Live $live }
+
+    Build-PickemTabs -Page $Page
 }
 
-# 单个 Swiss 阶段的视图：左「对阵表」右「种子排名」。
-function New-SwissStageView {
-    param($Stage)
-    $p = New-Object System.Windows.Forms.Panel
-    $p.Dock = 'Fill'
-    $p.BackColor = [System.Drawing.Color]::White
-
-    $split = New-Object System.Windows.Forms.TableLayoutPanel
-    $split.Dock = 'Fill'
-    $split.ColumnCount = 2
-    $split.RowCount = 1
-    $split.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 62))) | Out-Null
-    $split.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 38))) | Out-Null
-    $split.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 100))) | Out-Null
-    $p.Controls.Add($split)
-
-    # ---- 左：对阵 ----
-    # 用 TableLayoutPanel 分「标题 / 表格」两行，不靠 Dock 顺序 ——
-    # 直接往同一个 Panel 里先加 Top 再加 Fill，Fill 会整块盖住标题，
-    # 连 ListView 的列头一起挡掉。
-    $left = New-Object System.Windows.Forms.TableLayoutPanel
-    $left.Dock = 'Fill'
-    $left.ColumnCount = 1
-    $left.RowCount = 2
-    $left.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 0)
-    $left.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 100))) | Out-Null
-    $left.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 24))) | Out-Null
-    $left.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 100))) | Out-Null
-    $split.Controls.Add($left, 0, 0)
-
-    $cap = New-Object System.Windows.Forms.Label
-    $cap.Dock = 'Fill'
-    $cap.Margin = New-Object System.Windows.Forms.Padding(0)
-    $cap.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5, [System.Drawing.FontStyle]::Bold)
-    $cap.ForeColor = [System.Drawing.Color]::FromArgb(31, 41, 55)
-    $cap.TextAlign = 'MiddleLeft'
-    $cap.Text = '对阵表'
-    $left.Controls.Add($cap, 0, 0)
-
-    $gv = New-Object System.Windows.Forms.ListView
-    $gv.Dock = 'Fill'
-    $gv.Margin = New-Object System.Windows.Forms.Padding(0)
-    $gv.View = 'Details'
-    $gv.FullRowSelect = $true
-    $gv.GridLines = $false
-    $gv.HeaderStyle = 'Nonclickable'
-    $gv.BorderStyle = 'None'
-    $gv.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
-    $gv.Columns.Add('组', 60) | Out-Null
-    $gv.Columns.Add('队伍 1', 190) | Out-Null
-    $gv.Columns.Add('种子', 52) | Out-Null
-    $gv.Columns.Add('队伍 2', 190) | Out-Null
-    $gv.Columns.Add('种子', 52) | Out-Null
-    $gv.Columns.Add('时间', 118) | Out-Null
-    $left.Controls.Add($gv, 0, 1)
-
-    $matches = @($Stage.matches)
-    if ($matches.Count -eq 0) {
-        # 空状态直接塞一整行，避免只显示「（这个…」
-        $liEmpty = New-Object System.Windows.Forms.ListViewItem('（这个阶段还没有已排定的对阵，小组赛尚未开始）')
-        $gv.Items.Add($liEmpty) | Out-Null
-    } else {
-        # 按组排序，再按时间排；桶名里的 ZeroOne 之类排不出正确顺序，
-        # 所以用固定次序表决定谁在前。
-        $order = @('ZeroZero', 'OneZero', 'ZeroOne', 'TwoZero', 'OneOne', 'ZeroTwo',
-            'ThreeZero', 'TwoOne', 'OneTwo', 'ZeroThree', 'ThreeOne', 'TwoTwo',
-            'OneThree', 'ThreeTwo', 'TwoThree')
-        $sorted = $matches | Sort-Object @{ Expression = { [array]::IndexOf($order, $_.bucket) } }, time
-        foreach ($mt in $sorted) {
-            $label = if ($SwissBnNames.ContainsKey($mt.bucket)) { $SwissBnNames[$mt.bucket] } else { $mt.bucket }
-            $timeTxt = ''
-            if ($mt.time) {
-                try { $timeTxt = ([datetime]$mt.time).ToLocalTime().ToString('MM-dd HH:mm') } catch { $timeTxt = [string]$mt.time }
+function Apply-RealResults {
+    param($Stage, $Live)
+    if (-not $Live) { return }
+    $byPair = @{}
+    foreach ($m in @($Live.matches | Where-Object { $_.finished -and $_.winnerId })) {
+        $k = ((@($m.a, $m.b) | Sort-Object { $_.ToLowerInvariant() }) -join '|').ToLower()
+        $byPair[$k] = $m
+    }
+    for ($guard = 0; $guard -lt 6; $guard++) {
+        $pending = @($Stage.Matches | Where-Object { -not $_.Winner })
+        foreach ($mt in $pending) {
+            $k = ((@($mt.A, $mt.B) | Sort-Object { $_.ToLowerInvariant() }) -join '|').ToLower()
+            if ($byPair.ContainsKey($k)) {
+                $rm = $byPair[$k]
+                $winName = if ([string]$rm.aId -eq [string]$rm.winnerId) { $rm.a } else { $rm.b }
+                $side = if ($mt.A -eq $winName) { 'A' } else { 'B' }
+                Set-SwissWinner -Stage $Stage -Match $mt -Side $side | Out-Null
             }
-            $li = New-Object System.Windows.Forms.ListViewItem([string]$label)
-            $li.SubItems.Add([string]$mt.a) | Out-Null
-            $li.SubItems.Add([string]$mt.aSeed) | Out-Null
-            $li.SubItems.Add([string]$mt.b) | Out-Null
-            $li.SubItems.Add([string]$mt.bSeed) | Out-Null
-            $li.SubItems.Add($timeTxt) | Out-Null
-            $gv.Items.Add($li) | Out-Null
+        }
+        if (-not (Update-SwissStage -Stage $Stage)) { break }
+    }
+}
+
+function Build-PickemTabs {
+    param($Page)
+    $t = $Page.Tag
+    for ($i = 0; $i -lt 3; $i++) {
+        $tp = $t.Tabs.TabPages[$i]
+        $tp.Controls.Clear()
+        $cv = New-PickemCanvas -St $t.Stages[$i]
+        $cv.Tag.StageIndex = $i
+        $pageRef = $Page
+        $cv.Tag.OnChanged = { param($s) Update-PickemChain -Page $pageRef }.GetNewClosure()
+        $tp.Controls.Add($cv)
+    }
+    Update-PickemChain -Page $Page
+}
+
+function Update-PickemChain {
+    param($Page)
+    $t = $Page.Tag
+    $parts = @()
+    foreach ($st in $t.Stages) {
+        $alive = @($st.TeamList | Where-Object { $_.Status -eq 'alive' }).Count
+        $q = @($st.Qualified).Count
+        $e = @($st.Eliminated).Count
+        $parts += ('{0}: 晋级 {1} · 淘汰 {2} · 进行中 {3}' -f $st.Name, $q, $e, $alive)
+    }
+    $t.Foot.Text = ($parts -join '　｜　')
+
+    foreach ($tp in @($t.Tabs.TabPages)) {
+        foreach ($c in @($tp.Controls)) {
+            if ($c.Tag -and $c.Tag.ReLayout) { & $c.Tag.ReLayout $c; $c.Invalidate() }
         }
     }
 
-    # ---- 右：队伍与种子 ----
-    $right = New-Object System.Windows.Forms.TableLayoutPanel
-    $right.Dock = 'Fill'
-    $right.ColumnCount = 1
-    $right.RowCount = 2
-    $right.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 100))) | Out-Null
-    $right.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 24))) | Out-Null
-    $right.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 100))) | Out-Null
-    $split.Controls.Add($right, 1, 0)
-
-    $cap2 = New-Object System.Windows.Forms.Label
-    $cap2.Dock = 'Fill'
-    $cap2.Margin = New-Object System.Windows.Forms.Padding(0)
-    $cap2.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5, [System.Drawing.FontStyle]::Bold)
-    $cap2.ForeColor = [System.Drawing.Color]::FromArgb(31, 41, 55)
-    $cap2.TextAlign = 'MiddleLeft'
-    $cap2.Text = ('参赛队伍（{0} 支）' -f @($Stage.teams).Count)
-    $right.Controls.Add($cap2, 0, 0)
-
-    $lv2 = New-Object System.Windows.Forms.ListView
-    $lv2.Dock = 'Fill'
-    $lv2.Margin = New-Object System.Windows.Forms.Padding(0)
-    $lv2.View = 'Details'
-    $lv2.FullRowSelect = $true
-    $lv2.GridLines = $false
-    $lv2.HeaderStyle = 'Nonclickable'
-    $lv2.BorderStyle = 'None'
-    $lv2.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
-    $lv2.Columns.Add('种子', 56) | Out-Null
-    $lv2.Columns.Add('队伍', 250) | Out-Null
-    $right.Controls.Add($lv2, 0, 1)
-
-    $seedMap = @{}
-    foreach ($s in @($Stage.seedings)) { $seedMap[[string]$s.slot] = $s.seed }
-    $teamRows = @($Stage.teams) | Sort-Object @{ Expression = { $sd = $seedMap[[string]$_.slot]; if ($sd) { $sd } else { 999 } } }
-    foreach ($tm in $teamRows) {
-        $sd = $seedMap[[string]$tm.slot]
-        $li = New-Object System.Windows.Forms.ListViewItem($(if ($sd) { [string]$sd } else { '-' }))
-        $li.SubItems.Add([string]$tm.name) | Out-Null
-        $lv2.Items.Add($li) | Out-Null
-    }
-
-    return $p
-}
-
-# 淘汰赛视图：季军赛之前的三轮，槽位还没定就写 TBD。
-function New-PlayoffView {
-    param($Playoffs)
-    $p = New-Object System.Windows.Forms.Panel
-    $p.Dock = 'Fill'
-    $p.BackColor = [System.Drawing.Color]::White
-
-    $gv = New-Object System.Windows.Forms.ListView
-    $gv.Dock = 'Fill'
-    $gv.View = 'Details'
-    $gv.FullRowSelect = $true
-    $gv.GridLines = $false
-    $gv.HeaderStyle = 'Nonclickable'
-    $gv.BorderStyle = 'None'
-    $gv.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
-    $gv.Columns.Add('轮次', 160) | Out-Null
-    $gv.Columns.Add('槽位', 220) | Out-Null
-    $gv.Columns.Add('状态', 120) | Out-Null
-    $p.Controls.Add($gv)
-
-    foreach ($rd in @($Playoffs.rounds)) {
-        foreach ($sl in @($rd.slots)) {
-            $li = New-Object System.Windows.Forms.ListViewItem([string]$rd.name)
-            $li.SubItems.Add([string]$sl.id) | Out-Null
-            $li.SubItems.Add('待定') | Out-Null
-            $gv.Items.Add($li) | Out-Null
+    # Playoffs 页：8 强名单随 Stage 3 的进度变化，每次都要重建这张树
+    if ($t.Tabs.TabPages.Count -ge 4) {
+        $poTp = $t.Tabs.TabPages[3]
+        $needNew = ($poTp.Controls.Count -eq 0)
+        if ($needNew) {
+            $po = New-PlayoffCanvas -Stage1 $t.Stages[0] -Stage2 $t.Stages[1] -Stage3 $t.Stages[2]
+            $poTp.Controls.Add($po)
+        } else {
+            # 已有画布：只更新名单并重画，避免每次重排把用户拖动位置清掉
+            $po = $poTp.Controls[0]
+            if ($po.Tag) {
+                $eight = @(Get-SwissQualified -Stage $t.Stages[2])
+                if ($eight.Count -lt 8) {
+                    foreach ($x in @(Get-SwissQualified -Stage $t.Stages[1])) {
+                        if ($eight.Count -ge 8) { break }
+                        if (-not (@($eight | ForEach-Object { $_.Name }) -contains $x.Name)) { $eight += $x }
+                    }
+                }
+                $po.Tag.Eight = $eight
+                $po.Invalidate()
+            }
         }
     }
-    return $p
 }
 
-# 关于页：工具说明 + 版本 + 数据来源。
+
+# ---- 淘汰赛树状图 ----
+# 8 队单败：QF 4 场 / SF 2 场 / F 1 场。
+# 种子按 Valve 规则配：1v8 / 4v5 / 2v7 / 3v6（这四个组合在 HLTV 的
+# placement.quarterfinals 里是写死的，已验证）。
+function New-PlayoffCanvas {
+    param($Stage1, $Stage2, $Stage3)
+
+    $cv = New-Object System.Windows.Forms.Panel
+    $cv.Dock = 'Fill'
+    $cv.BackColor = [System.Drawing.Color]::FromArgb(18, 20, 26)
+    $cv.Margin = New-Object System.Windows.Forms.Padding(0)
+    $cv.Cursor = [System.Windows.Forms.Cursors]::Hand
+    Enable-DoubleBuffer $cv
+
+    $th = @{
+        Bg    = [System.Drawing.Color]::FromArgb(18, 20, 26)
+        Card  = [System.Drawing.Color]::FromArgb(28, 31, 38)
+        Edge  = [System.Drawing.Color]::FromArgb(48, 53, 62)
+        Txt   = [System.Drawing.Color]::FromArgb(235, 238, 243)
+        Dim   = [System.Drawing.Color]::FromArgb(120, 128, 140)
+        Accent= [System.Drawing.Color]::FromArgb(96, 165, 250)
+        Line  = [System.Drawing.Color]::FromArgb(56, 62, 74)
+        FontNm = (New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5))
+        FontHd = (New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5, [System.Drawing.FontStyle]::Bold))
+        FontSm = (New-Object System.Drawing.Font('Microsoft YaHei UI', 8))
+    }
+
+    $cv.Tag = @{
+        Th = $th
+        S1 = $Stage1; S2 = $Stage2; S3 = $Stage3
+        Pan = @{ X = 0; Y = 0 }
+        Drag = @{ On = $false; X = 0; Y = 0 }
+        Slots = (New-Object System.Collections.ArrayList)
+    }
+
+    # 组出 8 强名单：优先用 Stage 3 的晋级者；不够就按 Stage 1/2 补
+    $eight = @()
+    if ($Stage3) { $eight = @(Get-SwissQualified -Stage $Stage3) }
+    if ($eight.Count -lt 8 -and $Stage2) {
+        foreach ($t in @(Get-SwissQualified -Stage $Stage2)) {
+            if ($eight.Count -ge 8) { break }
+            if (-not (@($eight | ForEach-Object { $_.Name }) -contains $t.Name)) { $eight += $t }
+        }
+    }
+    $cv.Tag.Eight = $eight
+
+    $cv.Add_Paint({
+            param($s, $e)
+            $t = $s.Tag
+            $th = $t.Th
+            $g = $e.Graphics
+            $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
+            $g.Clear($th.Bg)
+            $px = $t.Pan.X; $py = $t.Pan.Y
+
+            $CW = 214; $CH = 62; $COLW = 286; $PADX = 24; $PADY = 52
+
+            $names = @('八强 (QF)', '四强 (SF)', '决赛 (Final)')
+            $hb = New-Object System.Drawing.SolidBrush($th.Accent)
+            try {
+                for ($c = 0; $c -lt 3; $c++) {
+                    $g.DrawString($names[$c], $th.FontHd, $hb, [single]($PADX + $c * $COLW + $px), [single](12 + $py))
+                }
+            } finally { $hb.Dispose() }
+
+            # 槽位坐标：QF 4 个均分，SF 2 个取中点，F 1 个居中
+            $boxes = @{}
+            for ($c = 0; $c -lt 3; $c++) {
+                $n = if ($c -eq 0) { 4 } elseif ($c -eq 1) { 2 } else { 1 }
+                $gap = if ($c -eq 0) { 108 } elseif ($c -eq 1) { 216 } else { 0 }
+                $startY = $PADY
+                if ($c -eq 1) { $startY = $PADY + 54 }
+                if ($c -eq 2) { $startY = $PADY + 162 }
+                for ($i = 0; $i -lt $n; $i++) {
+                    $boxes["$c-$i"] = @{
+                        X = $PADX + $c * $COLW + $px
+                        Y = $startY + $i * $gap + $py
+                    }
+                }
+            }
+
+            # 连线
+            $pen = New-Object System.Drawing.Pen($th.Line, 1.3)
+            try {
+                for ($c = 0; $c -lt 2; $c++) {
+                    $n = if ($c -eq 0) { 4 } else { 2 }
+                    for ($i = 0; $i -lt $n; $i++) {
+                        $src = $boxes["$c-$i"]
+                        $dst = $boxes["$($c+1)-$([int]($i / 2))"]
+                        if (-not $src -or -not $dst) { continue }
+                        $g.DrawLine($pen, $src.X + $CW, $src.Y + $CH / 2, $dst.X, $dst.Y + $CH / 2)
+                    }
+                }
+            } finally { $pen.Dispose() }
+
+            # 卡片
+            for ($c = 0; $c -lt 3; $c++) {
+                $n = if ($c -eq 0) { 4 } elseif ($c -eq 1) { 2 } else { 1 }
+                for ($i = 0; $i -lt $n; $i++) {
+                    $bx = $boxes["$c-$i"]
+                    $x = $bx.X; $y = $bx.Y
+
+                    $path = Get-RoundPath -W $CW -H $CH -R 9
+                    $fill = New-Object System.Drawing.SolidBrush($th.Card)
+                    $pen2 = New-Object System.Drawing.Pen($th.Edge, 1)
+                    $gs = $g.Save()
+                    $g.TranslateTransform([single]$x, [single]$y)
+                    try { $g.FillPath($fill, $path); $g.DrawPath($pen2, $path) }
+                    finally { $g.Restore($gs); $fill.Dispose(); $pen2.Dispose(); $path.Dispose() }
+
+                    # 八强：按种子规则填真实队名
+                    $n1 = 'TBD'; $n2 = 'TBD'
+                    if ($c -eq 0 -and $t.Eight.Count -ge 8) {
+                        # 1v8 / 4v5 / 2v7 / 3v6
+                        $pairs = @(@(0, 7), @(3, 4), @(1, 6), @(2, 5))
+                        $pi = $pairs[$i]
+                        $n1 = $t.Eight[$pi[0]].Name
+                        $n2 = $t.Eight[$pi[1]].Name
+                    }
+
+                    $tb = New-Object System.Drawing.SolidBrush($th.Txt)
+                    $db = New-Object System.Drawing.SolidBrush($th.Dim)
+                    try {
+                        $g.DrawString($n1, $th.FontNm, $tb, [single]($x + 10), [single]($y + 8))
+                        $g.DrawString($n2, $th.FontNm, $tb, [single]($x + 10), [single]($y + 32))
+                        if ($c -eq 0) {
+                            $g.DrawString(('QF{0}' -f ($i + 1)), $th.FontSm, $db, [single]($x + $CW - 40), [single]($y + $CH - 16))
+                        }
+                    } finally { $tb.Dispose(); $db.Dispose() }
+                }
+            }
+        })
+
+    $cv.Add_MouseDown({ param($s, $e) $s.Tag.Drag.On = $true; $s.Tag.Drag.X = $e.X; $s.Tag.Drag.Y = $e.Y })
+    $cv.Add_MouseMove({
+            param($s, $e)
+            if ($s.Tag.Drag.On) {
+                $s.Tag.Pan.X += ($e.X - $s.Tag.Drag.X)
+                $s.Tag.Pan.Y += ($e.Y - $s.Tag.Drag.Y)
+                $s.Tag.Drag.X = $e.X; $s.Tag.Drag.Y = $e.Y
+                $s.Invalidate()
+            }
+        })
+    $cv.Add_MouseUp({ param($s, $e) $s.Tag.Drag.On = $false })
+    $cv.Add_Resize({ param($s, $e) $s.Invalidate() })
+
+    return $cv
+}
+
+# ---- 关于页 ----
 function New-AboutPage {
     $page = New-Object System.Windows.Forms.Panel
     $page.Dock = 'Fill'
@@ -837,13 +1271,13 @@ function New-AboutPage {
     $txt.ReadOnly = $true
     $txt.BorderStyle = 'None'
     $txt.ScrollBars = 'Vertical'
+    $txt.WordWrap = $false
     $txt.Dock = 'Fill'
     $txt.BackColor = [System.Drawing.Color]::White
     $txt.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
     $txt.ForeColor = [System.Drawing.Color]::FromArgb(55, 65, 81)
     $txt.Margin = New-Object System.Windows.Forms.Padding(18, 18, 18, 18)
-    # 用字符串数组拼，不用 here-string：路径里的反斜杠（data\hltv-major.json）
-    # 经过多层转义容易被吃掉，拼数组最稳。
+
     $lines = @(
         'CS2 工具',
         '',
@@ -854,17 +1288,23 @@ function New-AboutPage {
         '  需要 Python 3.10+ 并安装 demoparser2 与 pandas。',
         '',
         'Major Pick''em',
-        '  展示 HLTV Major 模拟器（Swiss 轮）的完整对阵与种子。三个 Swiss 阶段与淘汰赛',
-        '  放在不同的页签里。数据来自本地快照 data\\hltv-major.json，只读展示。',
+        '  读取 HLTV Major 的实时比赛数据，按 Valve Swiss 规则排对阵：',
+        '    首轮按种子对折（1 号打 9 号，2 号打 10 号 …）',
+        '    之后按战绩分组，赢一场进「胜场+1」的组，输一场进「负场+1」的组',
+        '    先到 3 胜直接晋级，先到 3 负直接淘汰',
+        '    2 胜或 2 负的组打 BO3，其余 BO1',
+        '  点某一队就是判它赢，对阵会自动推进到下一轮。整张图可以拖动。',
         '',
-        '  说明：HLTV 有 Cloudflare 人机验证，程序自身无法直接抓取。',
-        '  快照需要用 tools\\fetch-hltv-sim.py 生成后放回。',
+        '数据来源',
+        '  HLTV 移动端 API（https://www.hltv.org/mobile/）。',
+        '  网页版有 Cloudflare 人机验证，普通 HTTP 客户端一律 403；',
+        '  官方 Android 客户端走的 /mobile/ 接口只认移动端 UA，可以直接取 JSON。',
+        '  刷新数据：python tools\hltv_mobile.py --event 9303',
         '',
         '关于',
-        '  界面：PowerShell 5.1 + WinForms，自绘圆角卡片与进度条。',
-        '  分析核心：src\\analyzer.py，demoparser2 后端。'
+        '  界面：PowerShell 5.1 + WinForms，自绘圆角卡片、进度条与对阵图。',
+        '  分析核心：src\analyzer.py，demoparser2 后端。'
     )
-    $txt.WordWrap = $false
     $txt.Text = ($lines -join [Environment]::NewLine)
     $card.Controls.Add($txt)
     return $page
@@ -1864,19 +2304,19 @@ function Show-Gui {
     $form.BackColor = (Get-UiBg)
 
     # 根布局用 TableLayoutPanel，避免 Dock 顺序的歧义
-    $root = New-Object System.Windows.Forms.TableLayoutPanel
-    $root.Dock = 'Fill'
-    $root.ColumnCount = 1
-    $root.RowCount = 4
-    $root.BackColor = (Get-UiBg)
-    $root.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 100))) | Out-Null
-    $root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 122))) | Out-Null
-    $root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 40))) | Out-Null
-    $root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 116))) | Out-Null
-    $root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 100))) | Out-Null
+    $uiRoot = New-Object System.Windows.Forms.TableLayoutPanel
+    $uiRoot.Dock = 'Fill'
+    $uiRoot.ColumnCount = 1
+    $uiRoot.RowCount = 4
+    $uiRoot.BackColor = (Get-UiBg)
+    $uiRoot.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 100))) | Out-Null
+    $uiRoot.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 122))) | Out-Null
+    $uiRoot.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 40))) | Out-Null
+    $uiRoot.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 116))) | Out-Null
+    $uiRoot.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 100))) | Out-Null
     # ---- 主界面：左侧导航 + 右侧功能区 ----
     # 原来的界面整块塞进右侧「Demo 统计」页，其余页是后加的。
-    # $root 仍是原来那个 TableLayoutPanel，只是爹从 $form 换成了 $pageDemo。
+    # $uiRoot 仍是原来那个 TableLayoutPanel，只是爹从 $form 换成了 $pageDemo。
     $shell = New-Object System.Windows.Forms.TableLayoutPanel
     $shell.Dock = 'Fill'
     $shell.ColumnCount = 2
@@ -1918,13 +2358,13 @@ function Show-Gui {
         Active = $null
     }
 
-    $root.Dock = 'Fill'
-    $root.Margin = New-Object System.Windows.Forms.Padding(0)
+    $uiRoot.Dock = 'Fill'
+    $uiRoot.Margin = New-Object System.Windows.Forms.Padding(0)
     $pageDemo = New-Object System.Windows.Forms.Panel
     $pageDemo.Dock = 'Fill'
     $pageDemo.BackColor = (Get-UiBg)
-    $root.Parent = $pageDemo
-    $pageDemo.Controls.Add($root)
+    $uiRoot.Parent = $pageDemo
+    $pageDemo.Controls.Add($uiRoot)
     $pageHost.Controls.Add($pageDemo)
     $script:App.Nav.Pages['demo'] = $pageDemo
 
@@ -1934,7 +2374,7 @@ function Show-Gui {
     $top.BackColor = [System.Drawing.Color]::White
     $top.Margin = New-Object System.Windows.Forms.Padding(6, 4, 6, 3)
     Enable-RoundCard -Control $top -Radius 12
-    $root.Controls.Add($top, 0, 0)
+    $uiRoot.Controls.Add($top, 0, 0)
 
     $btnPick = New-RoundButton -Text '选择 demo 文件...' -X 12 -Y 12 -W 150 -H 32 -Back @(255, 255, 255) -Fore @(31, 41, 55) -Hover @(238, 243, 254) -Edge @(211, 217, 230)
     $top.Controls.Add($btnPick)
@@ -2092,7 +2532,7 @@ function Show-Gui {
     $pp.BackColor = [System.Drawing.Color]::White
     $pp.Margin = New-Object System.Windows.Forms.Padding(6, 3, 6, 3)
     Enable-RoundCard -Control $pp -Radius 12
-    $root.Controls.Add($pp, 0, 1)
+    $uiRoot.Controls.Add($pp, 0, 1)
 
     $lblHalf = New-Object System.Windows.Forms.Label
     $lblHalf.Text = '半场（可多选）：'
@@ -2140,7 +2580,7 @@ function Show-Gui {
     $tlHost.Padding = New-Object System.Windows.Forms.Padding(6, 4, 6, 4)
     $tlHost.Margin = New-Object System.Windows.Forms.Padding(6, 3, 6, 3)
     Enable-RoundCard -Control $tlHost -Radius 12
-    $root.Controls.Add($tlHost, 0, 2)
+    $uiRoot.Controls.Add($tlHost, 0, 2)
 
     $tlTitle = New-Object System.Windows.Forms.Label
     $tlTitle.Dock = 'Top'
@@ -2278,7 +2718,7 @@ function Show-Gui {
     $row4 = New-Object System.Windows.Forms.Panel
     $row4.Dock = 'Fill'
     $row4.BackColor = (Get-UiBg)
-    $root.Controls.Add($row4, 0, 3)
+    $uiRoot.Controls.Add($row4, 0, 3)
 
     [void]$script:App.Splits.Clear()
     $tabs = New-Object System.Windows.Forms.TabControl
@@ -2551,7 +2991,7 @@ function Show-Gui {
     # 每项一个页面。demo 页已经建好（就是原界面），其余页在这个函数里现场建。
     Add-NavItem -Key 'demo' -Text 'Demo 统计' -Y 62 -Select | Out-Null
 
-    $pageHltv = New-HltvPickemPage
+    $pageHltv = New-PickemPage
     $script:App.Nav.Pages['hltv'] = $pageHltv
     $pageHost.Controls.Add($pageHltv)
     Add-NavItem -Key 'hltv' -Text 'Major Pick''em' -Y 104 | Out-Null
@@ -2561,7 +3001,7 @@ function Show-Gui {
     $pageHost.Controls.Add($pageAbout)
     Add-NavItem -Key 'about' -Text '关于' -Y 146 | Out-Null
 
-    Render-HltvPickem -Page $pageHltv
+    Render-PickemPage -Page $pageHltv
 
     Show-Page -Key 'demo'
 
@@ -2586,17 +3026,25 @@ if ($SelfTest) {
     $navNames = ($nav0.Items | ForEach-Object { $_.Key }) -join '/'
     Write-Output ("SelfTest 导航项 OK  {0}" -f $navNames)
 
-    # Major Pickem 页：快照读得到就该有四个阶段页签
+    # Major Pick em 页：四个阶段页签 + 已排好的首轮对阵
     $hpage = $nav0.Pages['hltv']
-    $htabs = $hpage.Tag.Tabs
-    Write-Output ("SelfTest Pickem页 OK  页签数={0}  页名={1}" -f `
-            $htabs.TabPages.Count, (($htabs.TabPages | ForEach-Object { $_.Text }) -join '/'))
     $hdata = $hpage.Tag.Data
-    if ($hdata) {
-        Write-Output ("SelfTest Pickem数据 OK  赛事={0}  阶段={1}  对阵={2}" -f `
-                $hdata.event, @($hdata.stages).Count, ((@($hdata.stages) | ForEach-Object { @($_.matches).Count }) -join ','))
+    $hstages = @($hpage.Tag.Stages)
+    $htabs = $hpage.Tag.Tabs
+    if ($hdata -and $hstages.Count -eq 3) {
+        Write-Output ("SelfTest Pickem页 OK  赛事={0}  页签={1}" -f `
+                $hdata.event, (($htabs.TabPages | ForEach-Object { $_.Text }) -join '/' ))
+        foreach ($st in $hstages) {
+            $alive = @($st.TeamList | Where-Object { $_.Status -eq 'alive'  }).Count
+            Write-Output ("SelfTest {0} OK  队伍={1}  对阵={2}  进行中={3}" -f `
+                    $st.Name, @($st.TeamList).Count, @($st.Matches).Count, $alive)
+        }
+        $hlogo = 0
+        $alln = @($hstages[0].TeamList | ForEach-Object { $_.Name })
+        foreach ($n in $alln) { if (Get-TeamLogo -Name $n) { $hlogo++ } }
+        Write-Output ("SelfTest Pickem Logo OK  {0}/{1}" -f $hlogo, $alln.Count)
     } else {
-        Write-Output ("SelfTest Pickem数据 SKIP  没有快照文件")
+        Write-Output "SelfTest Pickem页 SKIP  没有 data/all-stages.json"
     }
     Write-Output ("SelfTest 分页 OK  页数={0}  页名={1}" -f `
             $script:App.Tabs.TabPages.Count,
