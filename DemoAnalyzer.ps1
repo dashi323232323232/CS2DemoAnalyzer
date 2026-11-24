@@ -231,6 +231,31 @@ $ColsFun = @(
         T = '该阶段实际参与的回合数，也是 ADR 的分母。' }
 )
 
+# ---------------- HLTV Major 模拟器数据 ----------------
+# HLTV 有 Cloudflare 人机验证，Python / curl 直连一律 403（实测），
+# 只有带真实浏览器指纹的请求才拿得到页面。所以这里不联网抓，
+# 而是读一个已固化到本地的快照：data\hltv-major.json。
+# 快照由 tools\fetch-hltv-sim.py 生成，重新抓一次就更新。
+$HltvJson = Join-Path $Root 'data\hltv-major.json'
+
+# Swiss 轮的场次分组名 -> 中文。
+# 桶名是「已赢数 + 已输数」的英文，ZeroZero = 0 胜 0 负。
+$SwissBnNames = @{
+    ZeroZero = '0-0'; OneZero = '1-0'; ZeroOne = '0-1'; TwoZero = '2-0'
+    OneOne = '1-1'; ZeroTwo = '0-2'; ThreeZero = '3-0'; TwoOne = '2-1'
+    OneTwo = '1-2'; ZeroThree = '0-3'; ThreeOne = '3-1'; TwoTwo = '2-2'
+    OneThree = '1-3'; ThreeTwo = '3-2'; TwoThree = '2-3'
+}
+
+function Load-Hltv {
+    if (-not (Test-Path $HltvJson)) { return $null }
+    try {
+        return (Get-Content $HltvJson -Raw -Encoding UTF8 | ConvertFrom-Json)
+    } catch {
+        return $null
+    }
+}
+
 # ---------------- GUI ----------------
 # 重要：所有跨回调共享的对象必须放在 $script: 作用域。
 # 事件回调是在 Show-Gui 返回之后才触发的，函数局部变量那时已经不存在，
@@ -477,6 +502,402 @@ function New-RoundButton {
         })
     Set-RoundedRegion -Control $b -Radius $Radius
     return $b
+}
+
+# ---------------- 左侧导航 ----------------
+# 导航按钮自己画：选中态是浅蓝底 + 左侧 3px 蓝条，未选中是透明底，
+# 悬停变浅灰。用 Panel + Paint，和项目里其他自绘控件保持同一套画法。
+function New-NavButton {
+    param([string]$Text, [int]$Y)
+    $b = New-Object System.Windows.Forms.Panel
+    $b.Location = New-Object System.Drawing.Point(8, $Y)
+    $b.Size = New-Object System.Drawing.Size(160, 38)
+    $b.BackColor = [System.Drawing.Color]::Transparent
+    $b.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $b.Tag = @{ text = $Text; active = $false; hover = $false }
+    $b.Add_Paint({
+            param($s, $e)
+            $t = $s.Tag
+            $g = $e.Graphics
+            $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $w = $s.Width; $h = $s.Height
+            if ($t.active -or $t.hover) {
+                $bg = if ($t.active) { [System.Drawing.Color]::FromArgb(238, 243, 254) }
+                else { [System.Drawing.Color]::FromArgb(245, 247, 250) }
+                $br = New-Object System.Drawing.SolidBrush($bg)
+                try { $g.FillRectangle($br, 0, 0, $w, $h) } finally { $br.Dispose() }
+            }
+            if ($t.active) {
+                $bar = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(37, 99, 235))
+                try { $g.FillRectangle($bar, 0, 6, 3, $h - 12) } finally { $bar.Dispose() }
+            }
+            $fc = if ($t.active) { [System.Drawing.Color]::FromArgb(37, 99, 235) }
+            else { [System.Drawing.Color]::FromArgb(55, 65, 81) }
+            $font = if ($t.active) { New-Object System.Drawing.Font('Microsoft YaHei UI', 10, [System.Drawing.FontStyle]::Bold) }
+            else { New-Object System.Drawing.Font('Microsoft YaHei UI', 10) }
+            $tb = New-Object System.Drawing.SolidBrush($fc)
+            try {
+                $g.DrawString($t.text, $font, $tb, 16, [single](($h - $font.Height) / 2))
+            } finally { $tb.Dispose(); $font.Dispose() }
+        })
+    $b.Add_MouseEnter({ param($s, $e) $s.Tag.hover = $true; $s.Invalidate() })
+    $b.Add_MouseLeave({ param($s, $e) $s.Tag.hover = $false; $s.Invalidate() })
+    return $b
+}
+
+# ---------------- Major Pick'em 页 ----------------
+# 页面结构：顶部赛事信息 + 四个阶段页签（Stage 1 / 2 / 3 / Playoffs），
+# 下面是该阶段的 Swiss 轮对阵表。
+# 数据来自 data\hltv-major.json 快照，只读展示，不做预测计算。
+function New-HltvPickemPage {
+    $page = New-Object System.Windows.Forms.Panel
+    $page.Dock = 'Fill'
+    $page.BackColor = (Get-UiBg)
+    $page.Visible = $false
+
+    $lay = New-Object System.Windows.Forms.TableLayoutPanel
+    $lay.Dock = 'Fill'
+    $lay.ColumnCount = 1
+    $lay.RowCount = 3
+    $lay.BackColor = (Get-UiBg)
+    $lay.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 100))) | Out-Null
+    $lay.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 78))) | Out-Null
+    $lay.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 100))) | Out-Null
+    $lay.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 26))) | Out-Null
+    $page.Controls.Add($lay)
+
+    # ---- 顶部：赛事名 + 抓取时间 ----
+    $head = New-Object System.Windows.Forms.Panel
+    $head.Dock = 'Fill'
+    $head.BackColor = [System.Drawing.Color]::White
+    $head.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 6)
+    Enable-RoundCard -Control $head -Radius 12
+    $lay.Controls.Add($head, 0, 0)
+
+    $lblTitle = New-Object System.Windows.Forms.Label
+    $lblTitle.Location = New-Object System.Drawing.Point(16, 12)
+    $lblTitle.Size = New-Object System.Drawing.Size(900, 26)
+    $lblTitle.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 12, [System.Drawing.FontStyle]::Bold)
+    $lblTitle.ForeColor = [System.Drawing.Color]::FromArgb(17, 24, 39)
+    $lblTitle.Text = 'Major Pick''em'
+    $head.Controls.Add($lblTitle)
+
+    $lblSub = New-Object System.Windows.Forms.Label
+    $lblSub.Location = New-Object System.Drawing.Point(18, 42)
+    $lblSub.Size = New-Object System.Drawing.Size(1100, 20)
+    $lblSub.ForeColor = [System.Drawing.Color]::FromArgb(107, 114, 128)
+    $lblSub.Text = '正在读取本地快照…'
+    $head.Controls.Add($lblSub)
+
+    # ---- 中部：阶段页签 + 内容 ----
+    $body = New-Object System.Windows.Forms.Panel
+    $body.Dock = 'Fill'
+    $body.BackColor = [System.Drawing.Color]::White
+    $body.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 6)
+    Enable-RoundCard -Control $body -Radius 12
+    $lay.Controls.Add($body, 0, 1)
+
+    $tabs = New-Object System.Windows.Forms.TabControl
+    $tabs.Dock = 'Fill'
+    $tabs.ItemSize = New-Object System.Drawing.Size(150, 32)
+    $tabs.SizeMode = 'Fixed'
+    $tabs.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
+    # Margin 会让 Dock=Fill 的控件超出父容器，右边和下边被裁掉 —— 设成 0。
+    $tabs.Margin = New-Object System.Windows.Forms.Padding(0)
+    $tabs.Padding = New-Object System.Drawing.Point(14, 6)
+    $body.Controls.Add($tabs)
+
+    # ---- 底部：数据来源 ----
+    $lblFoot = New-Object System.Windows.Forms.Label
+    $lblFoot.Dock = 'Fill'
+    $lblFoot.ForeColor = [System.Drawing.Color]::FromArgb(156, 163, 175)
+    $lblFoot.TextAlign = 'MiddleLeft'
+    $lblFoot.Text = ''
+    $lay.Controls.Add($lblFoot, 0, 2)
+
+    $page.Tag = @{ Data = $null; Tabs = $tabs; Sub = $lblSub; Foot = $lblFoot; Title = $lblTitle }
+    return $page
+}
+
+# 把快照渲染进页面。页面建好后调用一次；重新抓取数据后再调一次即可刷新。
+function Render-HltvPickem {
+    param($Page)
+    if (-not $Page) { return }
+    $t = $Page.Tag
+    $data = Load-Hltv
+    $t.Data = $data
+
+    if (-not $data) {
+        $t.Sub.Text = '没有找到本地快照 data\hltv-major.json。运行 tools\fetch-hltv-sim.py 生成。'
+        $t.Foot.Text = ''
+        return
+    }
+
+    $t.Title.Text = ('Major Pick''em — ' + $data.event)
+    $t.Sub.Text = ('数据抓取于 {0}｜来源 {1}' -f $data.fetchedAt, $data.source)
+    $t.Foot.Text = ('共 {0} 个 Swiss 阶段 + 淘汰赛' -f @($data.stages).Count)
+
+    $t.Tabs.TabPages.Clear()
+
+    # Swiss 阶段
+    foreach ($st in @($data.stages)) {
+        $tp = New-Object System.Windows.Forms.TabPage
+        $tp.Text = $st.name
+        $tp.BackColor = [System.Drawing.Color]::White
+        $tp.Padding = New-Object System.Windows.Forms.Padding(10)
+        $tp.Controls.Add((New-SwissStageView -Stage $st))
+        $t.Tabs.TabPages.Add($tp)
+    }
+
+    # 淘汰赛
+    $po = New-Object System.Windows.Forms.TabPage
+    $po.Text = 'Playoffs'
+    $po.BackColor = [System.Drawing.Color]::White
+    $po.Padding = New-Object System.Windows.Forms.Padding(10)
+    $po.Controls.Add((New-PlayoffView -Playoffs $data.playoffs))
+    $t.Tabs.TabPages.Add($po)
+}
+
+# 单个 Swiss 阶段的视图：左「对阵表」右「种子排名」。
+function New-SwissStageView {
+    param($Stage)
+    $p = New-Object System.Windows.Forms.Panel
+    $p.Dock = 'Fill'
+    $p.BackColor = [System.Drawing.Color]::White
+
+    $split = New-Object System.Windows.Forms.TableLayoutPanel
+    $split.Dock = 'Fill'
+    $split.ColumnCount = 2
+    $split.RowCount = 1
+    $split.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 62))) | Out-Null
+    $split.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 38))) | Out-Null
+    $split.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 100))) | Out-Null
+    $p.Controls.Add($split)
+
+    # ---- 左：对阵 ----
+    # 用 TableLayoutPanel 分「标题 / 表格」两行，不靠 Dock 顺序 ——
+    # 直接往同一个 Panel 里先加 Top 再加 Fill，Fill 会整块盖住标题，
+    # 连 ListView 的列头一起挡掉。
+    $left = New-Object System.Windows.Forms.TableLayoutPanel
+    $left.Dock = 'Fill'
+    $left.ColumnCount = 1
+    $left.RowCount = 2
+    $left.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 0)
+    $left.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 100))) | Out-Null
+    $left.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 24))) | Out-Null
+    $left.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 100))) | Out-Null
+    $split.Controls.Add($left, 0, 0)
+
+    $cap = New-Object System.Windows.Forms.Label
+    $cap.Dock = 'Fill'
+    $cap.Margin = New-Object System.Windows.Forms.Padding(0)
+    $cap.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5, [System.Drawing.FontStyle]::Bold)
+    $cap.ForeColor = [System.Drawing.Color]::FromArgb(31, 41, 55)
+    $cap.TextAlign = 'MiddleLeft'
+    $cap.Text = '对阵表'
+    $left.Controls.Add($cap, 0, 0)
+
+    $gv = New-Object System.Windows.Forms.ListView
+    $gv.Dock = 'Fill'
+    $gv.Margin = New-Object System.Windows.Forms.Padding(0)
+    $gv.View = 'Details'
+    $gv.FullRowSelect = $true
+    $gv.GridLines = $false
+    $gv.HeaderStyle = 'Nonclickable'
+    $gv.BorderStyle = 'None'
+    $gv.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
+    $gv.Columns.Add('组', 60) | Out-Null
+    $gv.Columns.Add('队伍 1', 190) | Out-Null
+    $gv.Columns.Add('种子', 52) | Out-Null
+    $gv.Columns.Add('队伍 2', 190) | Out-Null
+    $gv.Columns.Add('种子', 52) | Out-Null
+    $gv.Columns.Add('时间', 118) | Out-Null
+    $left.Controls.Add($gv, 0, 1)
+
+    $matches = @($Stage.matches)
+    if ($matches.Count -eq 0) {
+        # 空状态直接塞一整行，避免只显示「（这个…」
+        $liEmpty = New-Object System.Windows.Forms.ListViewItem('（这个阶段还没有已排定的对阵，小组赛尚未开始）')
+        $gv.Items.Add($liEmpty) | Out-Null
+    } else {
+        # 按组排序，再按时间排；桶名里的 ZeroOne 之类排不出正确顺序，
+        # 所以用固定次序表决定谁在前。
+        $order = @('ZeroZero', 'OneZero', 'ZeroOne', 'TwoZero', 'OneOne', 'ZeroTwo',
+            'ThreeZero', 'TwoOne', 'OneTwo', 'ZeroThree', 'ThreeOne', 'TwoTwo',
+            'OneThree', 'ThreeTwo', 'TwoThree')
+        $sorted = $matches | Sort-Object @{ Expression = { [array]::IndexOf($order, $_.bucket) } }, time
+        foreach ($mt in $sorted) {
+            $label = if ($SwissBnNames.ContainsKey($mt.bucket)) { $SwissBnNames[$mt.bucket] } else { $mt.bucket }
+            $timeTxt = ''
+            if ($mt.time) {
+                try { $timeTxt = ([datetime]$mt.time).ToLocalTime().ToString('MM-dd HH:mm') } catch { $timeTxt = [string]$mt.time }
+            }
+            $li = New-Object System.Windows.Forms.ListViewItem([string]$label)
+            $li.SubItems.Add([string]$mt.a) | Out-Null
+            $li.SubItems.Add([string]$mt.aSeed) | Out-Null
+            $li.SubItems.Add([string]$mt.b) | Out-Null
+            $li.SubItems.Add([string]$mt.bSeed) | Out-Null
+            $li.SubItems.Add($timeTxt) | Out-Null
+            $gv.Items.Add($li) | Out-Null
+        }
+    }
+
+    # ---- 右：队伍与种子 ----
+    $right = New-Object System.Windows.Forms.TableLayoutPanel
+    $right.Dock = 'Fill'
+    $right.ColumnCount = 1
+    $right.RowCount = 2
+    $right.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 100))) | Out-Null
+    $right.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 24))) | Out-Null
+    $right.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 100))) | Out-Null
+    $split.Controls.Add($right, 1, 0)
+
+    $cap2 = New-Object System.Windows.Forms.Label
+    $cap2.Dock = 'Fill'
+    $cap2.Margin = New-Object System.Windows.Forms.Padding(0)
+    $cap2.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5, [System.Drawing.FontStyle]::Bold)
+    $cap2.ForeColor = [System.Drawing.Color]::FromArgb(31, 41, 55)
+    $cap2.TextAlign = 'MiddleLeft'
+    $cap2.Text = ('参赛队伍（{0} 支）' -f @($Stage.teams).Count)
+    $right.Controls.Add($cap2, 0, 0)
+
+    $lv2 = New-Object System.Windows.Forms.ListView
+    $lv2.Dock = 'Fill'
+    $lv2.Margin = New-Object System.Windows.Forms.Padding(0)
+    $lv2.View = 'Details'
+    $lv2.FullRowSelect = $true
+    $lv2.GridLines = $false
+    $lv2.HeaderStyle = 'Nonclickable'
+    $lv2.BorderStyle = 'None'
+    $lv2.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
+    $lv2.Columns.Add('种子', 56) | Out-Null
+    $lv2.Columns.Add('队伍', 250) | Out-Null
+    $right.Controls.Add($lv2, 0, 1)
+
+    $seedMap = @{}
+    foreach ($s in @($Stage.seedings)) { $seedMap[[string]$s.slot] = $s.seed }
+    $teamRows = @($Stage.teams) | Sort-Object @{ Expression = { $sd = $seedMap[[string]$_.slot]; if ($sd) { $sd } else { 999 } } }
+    foreach ($tm in $teamRows) {
+        $sd = $seedMap[[string]$tm.slot]
+        $li = New-Object System.Windows.Forms.ListViewItem($(if ($sd) { [string]$sd } else { '-' }))
+        $li.SubItems.Add([string]$tm.name) | Out-Null
+        $lv2.Items.Add($li) | Out-Null
+    }
+
+    return $p
+}
+
+# 淘汰赛视图：季军赛之前的三轮，槽位还没定就写 TBD。
+function New-PlayoffView {
+    param($Playoffs)
+    $p = New-Object System.Windows.Forms.Panel
+    $p.Dock = 'Fill'
+    $p.BackColor = [System.Drawing.Color]::White
+
+    $gv = New-Object System.Windows.Forms.ListView
+    $gv.Dock = 'Fill'
+    $gv.View = 'Details'
+    $gv.FullRowSelect = $true
+    $gv.GridLines = $false
+    $gv.HeaderStyle = 'Nonclickable'
+    $gv.BorderStyle = 'None'
+    $gv.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
+    $gv.Columns.Add('轮次', 160) | Out-Null
+    $gv.Columns.Add('槽位', 220) | Out-Null
+    $gv.Columns.Add('状态', 120) | Out-Null
+    $p.Controls.Add($gv)
+
+    foreach ($rd in @($Playoffs.rounds)) {
+        foreach ($sl in @($rd.slots)) {
+            $li = New-Object System.Windows.Forms.ListViewItem([string]$rd.name)
+            $li.SubItems.Add([string]$sl.id) | Out-Null
+            $li.SubItems.Add('待定') | Out-Null
+            $gv.Items.Add($li) | Out-Null
+        }
+    }
+    return $p
+}
+
+# 关于页：工具说明 + 版本 + 数据来源。
+function New-AboutPage {
+    $page = New-Object System.Windows.Forms.Panel
+    $page.Dock = 'Fill'
+    $page.BackColor = (Get-UiBg)
+    $page.Visible = $false
+
+    $card = New-Object System.Windows.Forms.Panel
+    $card.Dock = 'Fill'
+    $card.BackColor = [System.Drawing.Color]::White
+    $card.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 6)
+    Enable-RoundCard -Control $card -Radius 12
+    $page.Controls.Add($card)
+
+    $txt = New-Object System.Windows.Forms.TextBox
+    $txt.Multiline = $true
+    $txt.ReadOnly = $true
+    $txt.BorderStyle = 'None'
+    $txt.ScrollBars = 'Vertical'
+    $txt.Dock = 'Fill'
+    $txt.BackColor = [System.Drawing.Color]::White
+    $txt.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
+    $txt.ForeColor = [System.Drawing.Color]::FromArgb(55, 65, 81)
+    $txt.Margin = New-Object System.Windows.Forms.Padding(18, 18, 18, 18)
+    # 用字符串数组拼，不用 here-string：路径里的反斜杠（data\hltv-major.json）
+    # 经过多层转义容易被吃掉，拼数组最稳。
+    $lines = @(
+        'CS2 工具',
+        '',
+        '一个本地运行的 CS2 小工具集合。',
+        '',
+        'Demo 统计',
+        '  导入 CS2 / CS:GO 的 .dem 录像，按半场分段、按队伍分栏统计每个玩家的表现。',
+        '  需要 Python 3.10+ 并安装 demoparser2 与 pandas。',
+        '',
+        'Major Pick''em',
+        '  展示 HLTV Major 模拟器（Swiss 轮）的完整对阵与种子。三个 Swiss 阶段与淘汰赛',
+        '  放在不同的页签里。数据来自本地快照 data\\hltv-major.json，只读展示。',
+        '',
+        '  说明：HLTV 有 Cloudflare 人机验证，程序自身无法直接抓取。',
+        '  快照需要用 tools\\fetch-hltv-sim.py 生成后放回。',
+        '',
+        '关于',
+        '  界面：PowerShell 5.1 + WinForms，自绘圆角卡片与进度条。',
+        '  分析核心：src\\analyzer.py，demoparser2 后端。'
+    )
+    $txt.WordWrap = $false
+    $txt.Text = ($lines -join [Environment]::NewLine)
+    $card.Controls.Add($txt)
+    return $page
+}
+
+# 切页：只切可见性和高亮。页面停在内存里，切回去状态都还在。
+function Show-Page {
+    param([string]$Key)
+    $nav = $script:App.Nav
+    if (-not $nav) { return }
+    if (-not $nav.Pages.ContainsKey($Key)) { return }
+    foreach ($k in $nav.Pages.Keys) {
+        $nav.Pages[$k].Visible = ($k -eq $Key)
+    }
+    foreach ($item in $nav.Items) {
+        $isCur = ($item.Key -eq $Key)
+        $item.Btn.Tag.active = $isCur
+        $item.Btn.Invalidate()
+    }
+    $nav.Active = $Key
+}
+
+# 往导航栏里加一项并返回它的页面容器。
+function Add-NavItem {
+    param([string]$Key, [string]$Text, [int]$Y, [switch]$Select)
+    $nav = $script:App.Nav
+    $btn = New-NavButton -Text $Text -Y $Y
+    $keyCopy = $Key
+    $btn.Add_Click({ param($s, $e) Show-Page -Key $keyCopy }.GetNewClosure())
+    $nav.NavBar.Controls.Add($btn)
+    [void]$nav.Items.Add(@{ Key = $Key; Btn = $btn })
+    if ($Select) { Show-Page -Key $Key }
+    return $btn
 }
 
 function Set-Status {
@@ -1436,10 +1857,10 @@ function Show-Gui {
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'CS2 Demo 分析器'
-    $form.Size = New-Object System.Drawing.Size(1560, 820)
+    $form.Size = New-Object System.Drawing.Size(1660, 860)
     $form.StartPosition = 'CenterScreen'
     $form.Font = $font
-    $form.MinimumSize = New-Object System.Drawing.Size(1000, 560)
+    $form.MinimumSize = New-Object System.Drawing.Size(1240, 640)
     $form.BackColor = (Get-UiBg)
 
     # 根布局用 TableLayoutPanel，避免 Dock 顺序的歧义
@@ -1453,7 +1874,59 @@ function Show-Gui {
     $root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 40))) | Out-Null
     $root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 116))) | Out-Null
     $root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 100))) | Out-Null
-    $form.Controls.Add($root)
+    # ---- 主界面：左侧导航 + 右侧功能区 ----
+    # 原来的界面整块塞进右侧「Demo 统计」页，其余页是后加的。
+    # $root 仍是原来那个 TableLayoutPanel，只是爹从 $form 换成了 $pageDemo。
+    $shell = New-Object System.Windows.Forms.TableLayoutPanel
+    $shell.Dock = 'Fill'
+    $shell.ColumnCount = 2
+    $shell.RowCount = 1
+    $shell.BackColor = (Get-UiBg)
+    $shell.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Absolute', 176))) | Out-Null
+    $shell.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 100))) | Out-Null
+    $shell.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 100))) | Out-Null
+    $form.Controls.Add($shell)
+
+    $nav = New-Object System.Windows.Forms.Panel
+    $nav.Dock = 'Fill'
+    $nav.BackColor = [System.Drawing.Color]::White
+    $nav.Margin = New-Object System.Windows.Forms.Padding(4, 4, 2, 4)
+    Enable-RoundCard -Control $nav -Radius 12
+    $shell.Controls.Add($nav, 0, 0)
+
+    $brand = New-Object System.Windows.Forms.Label
+    $brand.Text = 'CS2 工具'
+    $brand.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 13, [System.Drawing.FontStyle]::Bold)
+    $brand.ForeColor = [System.Drawing.Color]::FromArgb(17, 24, 39)
+    $brand.Location = New-Object System.Drawing.Point(18, 16)
+    $brand.Size = New-Object System.Drawing.Size(150, 30)
+    $nav.Controls.Add($brand)
+
+    $pageHost = New-Object System.Windows.Forms.Panel
+    $pageHost.Dock = 'Fill'
+    $pageHost.BackColor = (Get-UiBg)
+    $pageHost.Margin = New-Object System.Windows.Forms.Padding(2, 4, 4, 4)
+    $shell.Controls.Add($pageHost, 1, 0)
+
+    # 导航项：只做「显隐 + 高亮」切换。页面建好一次就一直留着，
+    # 这样切回来时报告、时间轴选中状态都还在。
+    $script:App.Nav = @{
+        Items  = (New-Object System.Collections.ArrayList)
+        Pages  = @{}
+        Host   = $pageHost
+        NavBar = $nav
+        Active = $null
+    }
+
+    $root.Dock = 'Fill'
+    $root.Margin = New-Object System.Windows.Forms.Padding(0)
+    $pageDemo = New-Object System.Windows.Forms.Panel
+    $pageDemo.Dock = 'Fill'
+    $pageDemo.BackColor = (Get-UiBg)
+    $root.Parent = $pageDemo
+    $pageDemo.Controls.Add($root)
+    $pageHost.Controls.Add($pageDemo)
+    $script:App.Nav.Pages['demo'] = $pageDemo
 
     # ---- 第一行：操作区 ----
     $top = New-Object System.Windows.Forms.Panel
@@ -2074,6 +2547,24 @@ function Show-Gui {
         $script:App.BtnRun.Enabled = $true
     }
 
+    # ---- 导航项 ----
+    # 每项一个页面。demo 页已经建好（就是原界面），其余页在这个函数里现场建。
+    Add-NavItem -Key 'demo' -Text 'Demo 统计' -Y 62 -Select | Out-Null
+
+    $pageHltv = New-HltvPickemPage
+    $script:App.Nav.Pages['hltv'] = $pageHltv
+    $pageHost.Controls.Add($pageHltv)
+    Add-NavItem -Key 'hltv' -Text 'Major Pick''em' -Y 104 | Out-Null
+
+    $pageAbout = New-AboutPage
+    $script:App.Nav.Pages['about'] = $pageAbout
+    $pageHost.Controls.Add($pageAbout)
+    Add-NavItem -Key 'about' -Text '关于' -Y 146 | Out-Null
+
+    Render-HltvPickem -Page $pageHltv
+
+    Show-Page -Key 'demo'
+
     # ---- 整棵控件树开双缓冲 ----
     # 放在最后统一开：这时所有控件都建好了，包括两个 DataGridView。
     # 表格是重绘大头（每张约 11ms），拖分隔条时它俩会跟着实时改尺寸，
@@ -2089,6 +2580,24 @@ if ($SelfTest) {
     $f = Show-Gui
 
     Write-Output ("SelfTest 窗体 OK  控件数={0}" -f $f.Controls.Count)
+    # 导航壳：左侧三项，右侧是对应页面
+    $nav0 = $script:App.Nav
+    Write-Output ("SelfTest 导航栏 OK  项数={0}  当前={1}" -f $nav0.Items.Count, $nav0.Active)
+    $navNames = ($nav0.Items | ForEach-Object { $_.Key }) -join '/'
+    Write-Output ("SelfTest 导航项 OK  {0}" -f $navNames)
+
+    # Major Pickem 页：快照读得到就该有四个阶段页签
+    $hpage = $nav0.Pages['hltv']
+    $htabs = $hpage.Tag.Tabs
+    Write-Output ("SelfTest Pickem页 OK  页签数={0}  页名={1}" -f `
+            $htabs.TabPages.Count, (($htabs.TabPages | ForEach-Object { $_.Text }) -join '/'))
+    $hdata = $hpage.Tag.Data
+    if ($hdata) {
+        Write-Output ("SelfTest Pickem数据 OK  赛事={0}  阶段={1}  对阵={2}" -f `
+                $hdata.event, @($hdata.stages).Count, ((@($hdata.stages) | ForEach-Object { @($_.matches).Count }) -join ','))
+    } else {
+        Write-Output ("SelfTest Pickem数据 SKIP  没有快照文件")
+    }
     Write-Output ("SelfTest 分页 OK  页数={0}  页名={1}" -f `
             $script:App.Tabs.TabPages.Count,
         (($script:App.Tabs.TabPages | ForEach-Object { $_.Text }) -join '/'))
