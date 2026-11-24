@@ -1,0 +1,4 @@
+# PowerShell 脚本必须是 UTF-8 带 BOM，Git 不要碰任何编码/换行
+* -text
+*.exe binary
+*.png binary

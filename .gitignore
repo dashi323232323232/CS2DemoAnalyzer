@@ -1,0 +1,25 @@
+# 运行产物：每次分析都会覆盖
+out/*
+!out/.gitkeep
+
+# 本地开发过程中留下的备份 / 会话记录（不入库）
+recovery/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 日志
+*.log
+*.log.err
+*.error.txt
+
+# 本地 demo 录像（体积大、且不该进仓库）
+demos/
+*.dem
+*.dem.bz2
+
+# 系统文件
+Thumbs.db
+desktop.ini
+.DS_Store
