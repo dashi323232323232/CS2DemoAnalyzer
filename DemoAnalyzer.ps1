@@ -984,6 +984,12 @@ function Render-PickemPage {
 
     $t.Data = $data
     $t.Title.Text = ('Major Pick''em — ' + $data.event)
+    # 副标题原来只在初始化时写成「正在读取…」，成功加载后从来没覆盖过，
+    # 界面上就一直挂着那句话。这里补上。
+    $n1 = @($data.stages[0].teams).Count
+    $n2 = @($data.stages[1].teams).Count
+    $n3 = @($data.stages[2].teams).Count
+    $t.Sub.Text = ('Stage 1: {0} 队 · Stage 2: {1} 队 · Stage 3: {2} 队 · 点某一队即判它赢，整张图可拖动' -f $n1, $n2, $n3)
     $t.Tabs.TabPages.Clear()
     [void]$t.Stages.Clear()
 
