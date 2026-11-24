@@ -64,7 +64,9 @@ $edge = @(222, 226, 235)
 
 Chk 'form.BackColor' ($form.BackColor.R -eq $bg[0] -and $form.BackColor.G -eq $bg[1] -and $form.BackColor.B -eq $bg[2]) (Rgb $form.BackColor)
 
-$root = $form.Controls[0]
+# 主界面改成了「左侧导航 + 右侧功能区」的壳，$form.Controls[0] 现在是那个壳，
+# 原来的根布局（4 行的 TableLayoutPanel）挂在 demo 页里面。
+$root = $script:App.Nav.Pages['demo'].Controls[0]
 $top = $root.GetControlFromPosition(0, 0)
 Chk 'top card BackColor White' ($top -and $top.BackColor.R -eq 255 -and $top.BackColor.G -eq 255 -and $top.BackColor.B -eq 255) (Rgb $top.BackColor)
 Chk 'top card Region' ($top.Region -ne $null) ("client {0}x{1} region {2}" -f $top.ClientSize.Width, $top.ClientSize.Height, (RegSize $top))
